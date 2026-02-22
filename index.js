@@ -3,62 +3,61 @@ const midtransClient = require('midtrans-client');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const admin = require('firebase-admin');
-
-// Konfigurasi Environment Variables (Penting untuk Railway)
 require('dotenv').config();
 
-// 1. Inisialisasi Firebase Admin menggunakan Environment Variables
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL
-});
+// Singleton pattern for Firebase Admin to optimize Vercel Serverless
+if (!admin.apps.length) {
+    try {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            databaseURL: process.env.FIREBASE_DATABASE_URL
+        });
+        console.log("Firebase Admin Initialized");
+    } catch (error) {
+        console.error("Firebase initialization error:", error);
+    }
+}
 
 const db = admin.firestore();
 const app = express();
 
+// Middleware optimization
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// 2. Konfigurasi Midtrans menggunakan Environment Variables
-let snap = new midtransClient.Snap({
+// Midtrans Client Initialization
+const snap = new midtransClient.Snap({
     isProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
-// Root endpoint untuk cek server
+// Health Check
 app.get('/', (req, res) => {
-    res.send('Midtrans Backend for Top Up Saldo App is Running!');
+    res.status(200).json({ status: 'OK', message: 'Midtrans Backend v1.1.0 is active' });
 });
 
-// 3. Endpoint untuk membuat transaksi (Token Snap)
+// Endpoint: Charge / Create Transaction
 app.post('/api/charge', async (req, res) => {
     try {
         const { order_id, amount, user_id, user_name, user_email } = req.body;
 
-        let parameter = {
-            "transaction_details": {
-                "order_id": order_id,
-                "gross_amount": amount
-            },
-            "credit_card": {
-                "secure": true
-            },
-            "customer_details": {
-                "first_name": user_name,
-                "email": user_email
-            },
-            "metadata": {
-                "user_id": user_id
-            }
+        if (!order_id || !amount || !user_id) {
+            return res.status(400).json({ error: 'Missing required parameters' });
+        }
+
+        const parameter = {
+            transaction_details: { order_id, gross_amount: amount },
+            credit_card: { secure: true },
+            customer_details: { first_name: user_name, email: user_email },
+            metadata: { user_id }
         };
 
         const transaction = await snap.createTransaction(parameter);
 
-        // Simpan transaksi awal ke Firestore sebagai PENDING
+        // Initial transaction record in Firestore
         await db.collection('transactions').doc(order_id).set({
             userId: user_id,
             userName: user_name,
@@ -69,72 +68,69 @@ app.post('/api/charge', async (req, res) => {
             midtrans_token: transaction.token
         });
 
-        res.json(transaction);
+        res.status(200).json(transaction);
     } catch (error) {
-        console.error("Error creating transaction:", error);
+        console.error("Charge error:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 4. Endpoint Webhook / Notification Handler (Dipanggil oleh Midtrans)
+// Endpoint: Webhook Notification Handler
 app.post('/api/notification', async (req, res) => {
     try {
         const statusResponse = await snap.transaction.notification(req.body);
-        let orderId = statusResponse.order_id;
-        let transactionStatus = statusResponse.transaction_status;
-        let fraudStatus = statusResponse.fraud_status;
+        const { order_id, transaction_status, fraud_status } = statusResponse;
 
-        console.log(`Transaction notification received. Order ID: ${orderId}. Status: ${transactionStatus}. Fraud: ${fraudStatus}`);
+        console.log(`Webhook received: ID ${order_id}, Status ${transaction_status}`);
 
-        const trxRef = db.collection('transactions').doc(orderId);
+        const trxRef = db.collection('transactions').doc(order_id);
         const doc = await trxRef.get();
 
-        if (!doc.exists) {
-            return res.status(404).send('Transaction not found');
-        }
+        if (!doc.exists) return res.status(404).send('Not Found');
 
-        const trxData = doc.data();
-        const userId = trxData.userId;
-        const amount = trxData.amount;
+        const { userId, amount } = doc.data();
 
-        if (transactionStatus == 'capture') {
-            if (fraudStatus == 'challenge') {
+        if (transaction_status === 'capture' || transaction_status === 'settlement') {
+            if (fraud_status === 'challenge') {
                 await trxRef.update({ status: 'CHALLENGE' });
-            } else if (fraudStatus == 'accept') {
+            } else {
                 await handleSuccessPayment(userId, amount, trxRef);
             }
-        } else if (transactionStatus == 'settlement') {
-            await handleSuccessPayment(userId, amount, trxRef);
-        } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
+        } else if (['cancel', 'deny', 'expire'].includes(transaction_status)) {
             await trxRef.update({ status: 'FAILED' });
-        } else if (transactionStatus == 'pending') {
+        } else if (transaction_status === 'pending') {
             await trxRef.update({ status: 'PENDING' });
         }
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error("Notification Error:", error);
-        res.status(500).send(error.message);
+        console.error("Webhook error:", error);
+        res.status(500).send("Internal Server Error");
     }
 });
 
+// Payment Success Handler using Firestore Transaction
 async function handleSuccessPayment(userId, amount, trxRef) {
     const userRef = db.collection('users').doc(userId);
+    try {
+        await db.runTransaction(async (t) => {
+            const userDoc = await t.get(userRef);
+            if (!userDoc.exists) throw new Error("User not found");
 
-    // Gunakan Firestore Transaction untuk menambah saldo dengan aman
-    await db.runTransaction(async (t) => {
-        const userDoc = await t.get(userRef);
-        if (!userDoc.exists) throw "User does not exist!";
-
-        const currentBalance = userDoc.data().balance || 0;
-        const newBalance = currentBalance + amount;
-
-        t.update(userRef, { balance: newBalance });
-        t.update(trxRef, { status: 'SUCCESS' });
-    });
+            const newBalance = (userDoc.data().balance || 0) + amount;
+            t.update(userRef, { balance: newBalance });
+            t.update(trxRef, { status: 'SUCCESS' });
+        });
+    } catch (error) {
+        console.error("Transaction update error:", error);
+    }
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+// Export for Vercel Serverless
+module.exports = app;
+
+// Local development only
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => console.log(`Dev server on port ${PORT}`));
+}
