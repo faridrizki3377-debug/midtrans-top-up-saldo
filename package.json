@@ -1,0 +1,21 @@
+{
+  "name": "midtrans-backend",
+  "version": "1.0.0",
+  "description": "Backend for Midtrans Payment Integration and Firebase Balance Auto-Update",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "midtrans-client": "^1.3.1",
+    "body-parser": "^1.20.2",
+    "cors": "^2.8.5",
+    "firebase-admin": "^11.11.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
